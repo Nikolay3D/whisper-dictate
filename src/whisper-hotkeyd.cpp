@@ -1,5 +1,8 @@
 // whisper-hotkeyd
 //
+// SPDX-License-Identifier: MIT
+// Сторонние компоненты и атрибуции: см. THIRD_PARTY_NOTICES.md в корне проекта.
+//
 // Глобальная горячая клавиша для whisper-dictate + анимация записи поверх окон.
 //
 // Работа:
@@ -33,7 +36,7 @@
 #include <KGlobalAccel>
 
 static const int kPollMs = 400;
-static const int kWaveBars = 28;
+static const int kWaveBars = 18;
 
 // --- helpers ------------------------------------------------------------
 
@@ -96,7 +99,7 @@ public:
                        | Qt::Tool | Qt::WindowDoesNotAcceptFocus);
         setAttribute(Qt::WA_TranslucentBackground);
         setAttribute(Qt::WA_ShowWithoutActivating);
-        setFixedSize(380, 96);
+        setFixedSize(400, 96);
 
         QTimer *anim = new QTimer(this);
         anim->setInterval(33);
@@ -170,11 +173,12 @@ protected:
                    m_transcribing ? QStringLiteral("Распознаю...")
                                   : QStringLiteral("Запись..."));
 
-        // волна голоса
+        // волна голоса (в отдельной правой зоне, не наезжая на индикатор и текст)
         const qreal baseH = m_transcribing ? 12.0 : 24.0;
         const int bw = 6, gap = 4, nb = kWaveBars;
         const int totalW = nb * bw + (nb - 1) * gap;
-        const int x0 = width() - totalW - 24;
+        int x0 = width() - totalW - 22;
+        if (x0 < 170) { x0 = 170; }
         for (int i = 0; i < nb; ++i) {
             const qreal h = 6 + baseH * (0.5 + 0.5 * qAbs(qSin(m_phase * (m_transcribing ? 0.6 : 1.1) + i * 0.45)));
             const QRectF bar(x0 + i * (bw + gap), height() / 2.0 - h / 2, bw, h);

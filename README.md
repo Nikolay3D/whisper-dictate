@@ -17,6 +17,8 @@ whisper-dictate/
     ├── whisper-hotkeyd.cpp  — KGlobalAccel: ярлык Ctrl+E + анимация записи
     ├── CMakeLists.txt
     └── whisper-hotkeyd.desktop
+LICENSE                 — MIT, лицензия собственного кода
+THIRD_PARTY_NOTICES.md  — лицензии используемых компонентов (Whisper, Qt, KDE...) и атрибуции
 ```
 
 ## Как это работает (схема)
