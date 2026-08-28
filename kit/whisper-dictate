@@ -82,7 +82,12 @@ rm -f "$WAV" "$OUT.txt"
 set_state "recording"
 log "запись началась"
 setsid bash -c 'parec --raw --format=s16le --rate=16000 --channels=1 2>/dev/null | ffmpeg -loglevel error -f s16le -ar 16000 -ac 1 -i - -c:a pcm_s16le "$1"' _ "$WAV" &
-echo $! > "$PIDFILE"
+REC_PID=$!
+echo "$REC_PID" > "$PIDFILE"
 
-( sleep "$MAX_RECORD_SECONDS" && [ -f "$PIDFILE" ] && [ -n "$(cat "$PIDFILE")" ] && \
-    kill -0 -- "-$(cat "$PIDFILE")" 2>/dev/null && "$0" ) &
+( sleep "$MAX_RECORD_SECONDS" && \
+    [ "$(cat "$PIDFILE" 2>/dev/null)" = "$REC_PID" ] && \
+    kill -0 -- "-$REC_PID" 2>/dev/null && {
+        log "автостоп по лимиту $MAX_RECORD_SECONDS с"
+        "$0"
+    } ) &
