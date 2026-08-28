@@ -4,6 +4,7 @@ set -euo pipefail
 MODEL="$HOME/.local/share/whisper/models/ggml-large-v3-turbo-q8_0.bin"
 DIR="$HOME/.local/share/whisper"
 PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/whisper-dictate.pid"
+STATE="$DIR/tmp/state"
 WAV="$DIR/tmp/record.wav"
 OUT="$DIR/tmp/out"
 LOG="$DIR/tmp/log"
@@ -12,6 +13,7 @@ HOTWORDS="функция метод класс переменная массив
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >> "$LOG"; }
 notify() { notify-send -a Whisper "$1" "$2" 2>/dev/null || true; }
 play() { paplay "$1" 2>/dev/null || true; }
+set_state() { printf '%s' "$1" > "$STATE"; }
 
 stop_and_transcribe() {
     local pgid
@@ -23,6 +25,7 @@ stop_and_transcribe() {
         pkill -KILL -g "$pgid" 2>/dev/null || true
     fi
     play "$DIR/beep_stop.wav"
+    set_state "transcribing"
     log "запись остановлена, распознаю..."
 
     local text=""
@@ -40,11 +43,13 @@ stop_and_transcribe() {
     fi
 
     if [ -z "${text// }" ]; then
+        set_state "idle"
         notify "Ничего не распознано" "Повтори: нажми клавишу, говори, нажми ещё раз"
         log "ничего не распознано"
         exit 0
     fi
 
+    set_state "idle"
     if command -v wl-copy >/dev/null; then
         printf '%s' "$text" | wl-copy
     fi
@@ -73,6 +78,7 @@ fi
 play "$DIR/beep_start.wav"
 notify "Запись началась" "Говори. Повторное нажатие — распознать текст"
 rm -f "$WAV" "$OUT.txt"
+set_state "recording"
 log "запись началась"
 setsid bash -c 'parec --raw --format=s16le --rate=16000 --channels=1 2>/dev/null | ffmpeg -loglevel error -f s16le -ar 16000 -ac 1 -i - -c:a pcm_s16le "$1"' _ "$WAV" &
 echo $! > "$PIDFILE"

@@ -70,6 +70,21 @@ static bool recordingActive()
     return ::kill(-pid, 0) == 0 || ::kill(pid, 0) == 0;
 }
 
+// Статус из whisper-dictate: recording / transcribing / idle.
+static QString stateFilePath()
+{
+    return QDir::homePath() + QStringLiteral("/.local/share/whisper/tmp/state");
+}
+
+static QString readState()
+{
+    QFile f(stateFilePath());
+    if (!f.open(QIODevice::ReadOnly)) {
+        return QStringLiteral("idle");
+    }
+    return QString::fromUtf8(f.readAll().trimmed());
+}
+
 // --- оверлей ------------------------------------------------------------
 
 class OverlayWidget : public QWidget
@@ -90,6 +105,16 @@ public:
             update();
         });
         anim->start();
+    }
+
+    // false — «Запись...», true — «Распознаю...»
+    void setDisplay(bool transcribing)
+    {
+        if (m_transcribing == transcribing) {
+            return;
+        }
+        m_transcribing = transcribing;
+        update();
     }
 
 protected:
@@ -115,13 +140,24 @@ protected:
         p.setBrush(QColor(255, 255, 255, 8));
         p.drawRoundedRect(pill.adjusted(0, 0, 0, -pill.height() / 2), 22, 22);
 
-        // пульсирующая точка
         const QPointF dot(28, height() / 2.0);
-        const qreal pulse = 0.5 + 0.5 * qAbs(qSin(m_phase));
-        p.setBrush(QColor(255, 64, 64, 120));
-        p.drawEllipse(dot, 9 + pulse * 4, 9 + pulse * 4);
-        p.setBrush(QColor(255, 64, 64));
-        p.drawEllipse(dot, 6, 6);
+
+        if (m_transcribing) {
+            // оранжевый спиннер распознавания
+            p.save();
+            p.translate(dot);
+            p.rotate(m_phase * 40.0);
+            p.setPen(QPen(QColor(255, 190, 64), 3.5, Qt::SolidLine, Qt::RoundCap));
+            p.drawArc(QRectF(-9.5, -9.5, 19, 19), 0, 110 * 16);
+            p.restore();
+        } else {
+            // пульсирующая красная точка записи
+            const qreal pulse = 0.5 + 0.5 * qAbs(qSin(m_phase));
+            p.setBrush(QColor(255, 64, 64, 120));
+            p.drawEllipse(dot, 9 + pulse * 4, 9 + pulse * 4);
+            p.setBrush(QColor(255, 64, 64));
+            p.drawEllipse(dot, 6, 6);
+        }
 
         // текст
         QFont f = font();
@@ -131,24 +167,26 @@ protected:
         p.setPen(QColor(255, 255, 255));
         p.drawText(QRect(48, 10, 150, height() - 20),
                    Qt::AlignVCenter | Qt::AlignLeft,
-                   QStringLiteral("Запись..."));
+                   m_transcribing ? QStringLiteral("Распознаю...")
+                                  : QStringLiteral("Запись..."));
 
         // волна голоса
-        const qreal baseH = 24.0;
+        const qreal baseH = m_transcribing ? 12.0 : 24.0;
         const int bw = 6, gap = 4, nb = kWaveBars;
         const int totalW = nb * bw + (nb - 1) * gap;
         const int x0 = width() - totalW - 24;
         for (int i = 0; i < nb; ++i) {
-            const qreal h = 6 + baseH * (0.5 + 0.5 * qAbs(qSin(m_phase * 1.1 + i * 0.45)));
+            const qreal h = 6 + baseH * (0.5 + 0.5 * qAbs(qSin(m_phase * (m_transcribing ? 0.6 : 1.1) + i * 0.45)));
             const QRectF bar(x0 + i * (bw + gap), height() / 2.0 - h / 2, bw, h);
             p.setPen(Qt::NoPen);
-            p.setBrush(QColor(70, 205, 115));
+            p.setBrush(m_transcribing ? QColor(255, 190, 64) : QColor(70, 205, 115));
             p.drawRoundedRect(bar, 3, 3);
         }
     }
 
 private:
     double m_phase = 0.0;
+    bool m_transcribing = false;
 };
 
 // --- main ---------------------------------------------------------------
@@ -174,20 +212,33 @@ int main(int argc, char **argv)
 
     OverlayWidget overlay;
 
+    auto refreshOverlay = [&]() {
+        const QString st = readState();
+        bool transcribing = false;
+        bool active = false;
+        if (st == QLatin1String("recording")) {
+            active = true;
+        } else if (st == QLatin1String("transcribing")) {
+            active = true;
+            transcribing = true;
+        } else {
+            active = recordingActive();   // fallback: pid-файл (старый скрипт)
+        }
+        if (active) {
+            overlay.setDisplay(transcribing);
+        }
+        overlay.setVisible(active);
+    };
+
     QObject::connect(action, &QAction::triggered, [&]() {
         QProcess::startDetached(scriptPath());
         QTimer::singleShot(std::chrono::milliseconds(250), &overlay, [&]() {
-            overlay.setVisible(recordingActive());
+            refreshOverlay();
         });
     });
 
     QTimer *poll = new QTimer(&app);
-    QObject::connect(poll, &QTimer::timeout, [&]() {
-        const bool active = recordingActive();
-        if (active != overlay.isVisible()) {
-            overlay.setVisible(active);
-        }
-    });
+    QObject::connect(poll, &QTimer::timeout, refreshOverlay);
     poll->start(kPollMs);
 
     std::fprintf(stderr,
