@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODEL="$HOME/.local/share/whisper/models/ggml-large-v3-turbo-q8_0.bin"
+DIR="$HOME/.local/share/whisper"
+PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/whisper-dictate.pid"
+WAV="$DIR/tmp/record.wav"
+OUT="$DIR/tmp/out"
+LOG="$DIR/tmp/log"
+HOTWORDS="функция метод класс переменная массив список цикл условие обработчик ошибка исключение каждого git merge branch main commit pull push async await debug define install update test"
+
+log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >> "$LOG"; }
+notify() { notify-send -a Whisper "$1" "$2" 2>/dev/null || true; }
+play() { paplay "$1" 2>/dev/null || true; }
+
+stop_and_transcribe() {
+    local pgid
+    pgid=$(cat "$PIDFILE" 2>/dev/null || true)
+    rm -f "$PIDFILE"
+    if [ -n "$pgid" ] && kill -0 -- "-$pgid" 2>/dev/null; then
+        pkill -TERM -g "$pgid" -f parec || true
+        sleep 0.4
+        pkill -KILL -g "$pgid" 2>/dev/null || true
+    fi
+    play "$DIR/beep_stop.wav"
+    log "запись остановлена, распознаю..."
+
+    local text=""
+    if [ -s "$WAV" ]; then
+        notify "Распознаю..." ""
+        if whisper-cli -m "$MODEL" -f "$WAV" -l ru --prompt "$HOTWORDS" \
+              -otxt -of "$OUT" -np -t "$(nproc)" 2>/dev/null; then
+            text=$(tr '\n' ' ' < "$OUT.txt" 2>/dev/null | sed 's/  */ /g; s/^ //; s/ $//')
+        else
+            play "$DIR/beep_err.wav"
+            log "ОШИБКА распознавания"
+        fi
+    else
+        log "запись пустая"
+    fi
+
+    if [ -z "${text// }" ]; then
+        notify "Ничего не распознано" "Повтори: нажми клавишу, говори, нажми ещё раз"
+        log "ничего не распознано"
+        exit 0
+    fi
+
+    if command -v wl-copy >/dev/null; then
+        printf '%s' "$text" | wl-copy
+    fi
+    printf '%s\n' "$text" >> "$DIR/tmp/history.txt"
+    log "готово: $text"
+    notify "Готово — Ctrl+V" "$text"
+    echo "$text"
+}
+
+if [ -f "$PIDFILE" ]; then
+    pgid=$(cat "$PIDFILE" 2>/dev/null || true)
+    if [ -n "$pgid" ] && kill -0 -- "-$pgid" 2>/dev/null; then
+        stop_and_transcribe
+        exit 0
+    else
+        rm -f "$PIDFILE"
+    fi
+fi
+
+if [ -f "$PIDFILE" ]; then
+    play "$DIR/beep_err.wav"
+    notify "Уже идёт запись" "или процесс завис — удали $PIDFILE"
+    exit 1
+fi
+
+play "$DIR/beep_start.wav"
+notify "Запись началась" "Говори. Повторное нажатие — распознать текст"
+rm -f "$WAV" "$OUT.txt"
+log "запись началась"
+setsid bash -c 'parec --raw --format=s16le --rate=16000 --channels=1 2>/dev/null | ffmpeg -loglevel error -f s16le -ar 16000 -ac 1 -i - -c:a pcm_s16le "$1"' _ "$WAV" &
+echo $! > "$PIDFILE"
+
+( sleep 120 && [ -f "$PIDFILE" ] && [ -n "$(cat "$PIDFILE")" ] && \
+    kill -0 -- "-$(cat "$PIDFILE")" 2>/dev/null && "$0" ) &

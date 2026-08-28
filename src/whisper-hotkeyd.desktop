@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Whisper Dictation Hotkey
+Name[ru]=Диктовка Whisper (горячая клавиша)
+Comment=Global hotkey + recording overlay for whisper-dictate
+Comment[ru]=Глобальная клавиша и анимация записи для whisper-dictate
+Exec=whisper-hotkeyd
+Terminal=false
+X-KDE-autostart-after=panel
+X-KDE-autostart-phase=3
+Categories=Utility;
