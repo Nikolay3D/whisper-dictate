@@ -8,6 +8,7 @@ STATE="$DIR/tmp/state"
 WAV="$DIR/tmp/record.wav"
 OUT="$DIR/tmp/out"
 LOG="$DIR/tmp/log"
+MAX_RECORD_SECONDS="${WHISPER_MAX_SECONDS:-300}"
 HOTWORDS="функция метод класс переменная массив список цикл условие обработчик ошибка исключение каждого git merge branch main commit pull push async await debug define install update test"
 
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >> "$LOG"; }
@@ -83,5 +84,5 @@ log "запись началась"
 setsid bash -c 'parec --raw --format=s16le --rate=16000 --channels=1 2>/dev/null | ffmpeg -loglevel error -f s16le -ar 16000 -ac 1 -i - -c:a pcm_s16le "$1"' _ "$WAV" &
 echo $! > "$PIDFILE"
 
-( sleep 120 && [ -f "$PIDFILE" ] && [ -n "$(cat "$PIDFILE")" ] && \
+( sleep "$MAX_RECORD_SECONDS" && [ -f "$PIDFILE" ] && [ -n "$(cat "$PIDFILE")" ] && \
     kill -0 -- "-$(cat "$PIDFILE")" 2>/dev/null && "$0" ) &
