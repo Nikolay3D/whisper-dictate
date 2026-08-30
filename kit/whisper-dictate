@@ -9,9 +9,12 @@ WAV="$DIR/tmp/record.wav"
 OUT="$DIR/tmp/out"
 LOG="$DIR/tmp/log"
 MAX_RECORD_SECONDS="${WHISPER_MAX_SECONDS:-300}"
-HOTWORDS="функция метод класс переменная массив список цикл условие обработчик ошибка исключение каждого git merge branch main commit pull push async await debug define install update test"
+HOTWORDS="Например, так: запятая, точка, тире — и вопрос: Как дела? Это пример пунктуации. \
+функция метод класс переменная массив список цикл условие обработчик ошибка исключение каждого \
+git merge branch main commit pull push async await debug define install update test"
 
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >> "$LOG"; }
+dur() { ffprobe -v error -show_entries format=duration -of csv=p=0 "$WAV" 2>/dev/null || echo 0; }
 notify() { notify-send -a Whisper "$1" "$2" 2>/dev/null || true; }
 play() { paplay "$1" 2>/dev/null || true; }
 set_state() { printf '%s' "$1" > "$STATE"; }
@@ -21,13 +24,21 @@ stop_and_transcribe() {
     pgid=$(cat "$PIDFILE" 2>/dev/null || true)
     rm -f "$PIDFILE"
     if [ -n "$pgid" ] && kill -0 -- "-$pgid" 2>/dev/null; then
-        pkill -TERM -g "$pgid" -f parec || true
-        sleep 0.4
-        pkill -KILL -g "$pgid" 2>/dev/null || true
+        # Аккуратно завершаем parec, чтобы не обрезать хвост фразы:
+        # TERM закрывает источник, ffmpeg дочитывает пайп до EOF (весь буфер FFmpeg
+        # записывает в файл) и завершается сам. KILL — только если завис.
+        pkill -TERM -g "$pgid" -x parec || true
+        for _ in $(seq 1 60); do        # до 6 с — достаточно дождаться флаша ffmpeg
+            kill -0 -- "-$pgid" 2>/dev/null || break
+            sleep 0.1
+        done
+        if kill -0 -- "-$pgid" 2>/dev/null; then
+            pkill -KILL -g "$pgid" 2>/dev/null || true
+        fi
     fi
     play "$DIR/beep_stop.wav"
     set_state "transcribing"
-    log "запись остановлена, распознаю..."
+    log "запись остановлена, длительность=$(dur)s, распознаю..."
 
     local text=""
     if [ -s "$WAV" ]; then
@@ -78,6 +89,11 @@ fi
 
 play "$DIR/beep_start.wav"
 notify "Запись началась" "Говори. Повторное нажатие — распознать текст"
+# Прибиваем осиротевшие записи прошлых циклов (иначе они могут писать в один
+# WAV вместе с новой записью, портя файл и забирая микрофон).
+pkill -x parec 2>/dev/null || true
+pkill -x ffmpeg 2>/dev/null || true
+sleep 0.4
 rm -f "$WAV" "$OUT.txt"
 set_state "recording"
 log "запись началась"

@@ -3,19 +3,21 @@
 // SPDX-License-Identifier: MIT
 // Сторонние компоненты и атрибуции: см. THIRD_PARTY_NOTICES.md в корне проекта.
 //
-// Глобальная горячая клавиша для whisper-dictate + анимация записи поверх окон.
+// Глобальная горячая клавиша для голосовой диктовки + оверлей статуса поверх окон.
 //
-// Работа:
+// Демон владеет всем жизненным циклом диктовки:
 //   - регистрирует глобальный ярлык через KGlobalAccel (по умолчанию Ctrl+E);
-//   - по нажатию запускает скрипт whisper-dictate (он сам решает: начать/остановить
-//     запись и распознать);
-//   - пока запись активна (по pid-файлу) показывает анимацию голоса внизу экрана.
+//   - по нажатию сам запускает/останавливает запись (parec | ffmpeg);
+//   - сам вызывает whisper-cli для распознавания и парсит результат;
+//   - держит состояние (запись/распознавание/покой) в памяти и переключает
+//     оверлей напрямую — без промежуточного скрипта и state-файла.
 //
-// Ресурсы: в покое несколько МБ RAM. Модель не трогает — её грузит whisper-dictate
-// только на время распознавания.
+// Ресурсы: в покое несколько МБ RAM. Модель не трогаем — whisper-cli грузит
+// её только на время распознавания.
 
 #include <QApplication>
 #include <QWidget>
+#include <QCursor>
 #include <QAction>
 #include <QKeySequence>
 #include <QTimer>
@@ -25,6 +27,10 @@
 #include <QPainterPath>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
+#include <QStandardPaths>
+#include <QThread>
+#include <QDateTime>
 #include <QtMath>
 #include <chrono>
 
@@ -35,57 +41,82 @@
 
 #include <KGlobalAccel>
 
-static const int kPollMs = 400;
-static const int kWaveBars = 18;
+static const int kPostRollMs = 600;      // хвост после стопа: whisper дорешивает
+                                         // последний слог/слово в тишине перед EOF
+static const int kFinishTimeoutMs = 6000; // сколько ждём ffmpeg после остановки
 
-// --- helpers ------------------------------------------------------------
+// --- пути и ресурсы ------------------------------------------------------
 
-static QString scriptPath()
+static QString dataDir()
 {
-    const QByteArray env = qgetenv("WHISPER_SCRIPT");
-    if (!env.isEmpty()) {
-        return QString::fromLocal8Bit(env);
-    }
-    return QDir::homePath() + QStringLiteral("/.local/bin/whisper-dictate");
+    return QDir::homePath() + QStringLiteral("/.local/share/whisper");
 }
 
-static QString pidFilePath()
+static QString modelPath()
 {
-    const QString base = QString::fromLocal8Bit(qgetenv("XDG_RUNTIME_DIR"));
-    if (!base.isEmpty()) {
-        return base + QStringLiteral("/whisper-dictate.pid");
-    }
-    return QStringLiteral("/tmp/whisper-dictate.pid");
+    return dataDir() + QStringLiteral("/models/ggml-large-v3-turbo-q8_0.bin");
 }
 
-// Идёт ли запись: жив ли процесс, который сохранил pid-файл (группа setsid).
-static bool recordingActive()
+static QString wavPath()
 {
-    QFile f(pidFilePath());
-    if (!f.open(QIODevice::ReadOnly)) {
-        return false;
-    }
-    bool ok = false;
-    const pid_t pid = f.readAll().trimmed().toLongLong(&ok);
-    if (!ok || pid <= 0) {
-        return false;
-    }
-    return ::kill(-pid, 0) == 0 || ::kill(pid, 0) == 0;
+    return dataDir() + QStringLiteral("/tmp/record.wav");
 }
 
-// Статус из whisper-dictate: recording / transcribing / idle.
-static QString stateFilePath()
+static QString outPath()
 {
-    return QDir::homePath() + QStringLiteral("/.local/share/whisper/tmp/state");
+    return dataDir() + QStringLiteral("/tmp/out");
 }
 
-static QString readState()
+static QString logPath()
 {
-    QFile f(stateFilePath());
-    if (!f.open(QIODevice::ReadOnly)) {
-        return QStringLiteral("idle");
+    return dataDir() + QStringLiteral("/tmp/log");
+}
+
+static QString historyPath()
+{
+    return dataDir() + QStringLiteral("/tmp/history.txt");
+}
+
+static void logMsg(const QString &msg)
+{
+    QFile f(logPath());
+    if (f.open(QIODevice::Append | QIODevice::Text)) {
+        f.write(QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss")).toUtf8());
+        f.write(" ");
+        f.write(msg.toUtf8());
+        f.write("\n");
     }
-    return QString::fromUtf8(f.readAll().trimmed());
+}
+
+// Короткая фраза-подсказка: задаёт модели стиль вывода с пунктуацией.
+static QString hotwordPrompt()
+{
+    return QStringLiteral(
+        "Например, так: запятая, точка, тире — и вопрос: Как дела? Это пример пунктуации. "
+        "функция метод класс переменная массив список цикл условие обработчик ошибка "
+        "исключение каждого git merge branch main commit pull push async await debug "
+        "define install update test");
+}
+
+// Внешний однострочный процесс без ожидания (beep, уведомления).
+static void fireAndForget(const QString &program, const QStringList &args)
+{
+    QProcess *p = new QProcess();
+    p->setProgram(program);
+    p->setArguments(args);
+    QObject::connect(p, &QProcess::finished, p, &QObject::deleteLater);
+    p->start();
+}
+
+static void beep(const QString &name)
+{
+    fireAndForget(QStringLiteral("paplay"), {dataDir() + QLatin1Char('/') + name + QStringLiteral(".wav")});
+}
+
+static void notify(const QString &title, const QString &body)
+{
+    fireAndForget(QStringLiteral("notify-send"),
+                  {QStringLiteral("-a"), QStringLiteral("Whisper"), title, body});
 }
 
 // --- оверлей ------------------------------------------------------------
@@ -99,18 +130,19 @@ public:
                        | Qt::Tool | Qt::WindowDoesNotAcceptFocus);
         setAttribute(Qt::WA_TranslucentBackground);
         setAttribute(Qt::WA_ShowWithoutActivating);
-        setFixedSize(400, 96);
+        setFixedSize(170, 35);
 
         QTimer *anim = new QTimer(this);
         anim->setInterval(33);
         connect(anim, &QTimer::timeout, this, [this]() {
-            m_phase += 0.35;
+            m_phase += 0.12;
+            place();
             update();
         });
         anim->start();
     }
 
-    // false — «Запись...», true — «Распознаю...»
+    // false — запись, true — распознавание
     void setDisplay(bool transcribing)
     {
         if (m_transcribing == transcribing) {
@@ -123,11 +155,24 @@ public:
 protected:
     void showEvent(QShowEvent *) override
     {
-        if (QScreen *screen = QGuiApplication::primaryScreen()) {
-            const QRect g = screen->availableGeometry();
-            move(g.center().x() - width() / 2,
-                 g.bottom() - height() - 16);
+        place();
+    }
+
+    void place()
+    {
+        if (!isVisible()) {
+            return;
         }
+        QScreen *screen = QGuiApplication::screenAt(QCursor::pos());
+        if (!screen) {
+            screen = QGuiApplication::primaryScreen();
+        }
+        if (!screen) {
+            return;
+        }
+        const QRect g = screen->availableGeometry();
+        move(g.center().x() - width() / 2,
+             g.bottom() - height() - 12);
     }
 
     void paintEvent(QPaintEvent *) override
@@ -135,62 +180,436 @@ protected:
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing);
 
-        // фон-«таблетка»
         QRectF pill(rect().adjusted(1, 1, -1, -1));
-        p.setPen(Qt::NoPen);
-        p.setBrush(QColor(18, 18, 24, 238));
-        p.drawRoundedRect(pill, 22, 22);
-        p.setBrush(QColor(255, 255, 255, 8));
-        p.drawRoundedRect(pill.adjusted(0, 0, 0, -pill.height() / 2), 22, 22);
+        p.setPen(QPen(QColor(0, 0, 0), 2));
+        p.setBrush(QColor(255, 255, 255));
+        p.drawRoundedRect(pill, 12, 12);
 
-        const QPointF dot(28, height() / 2.0);
+        const QPointF dot(20, height() / 2.0);
+
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(0, 0, 0));
+        p.drawEllipse(dot, 13, 13);
 
         if (m_transcribing) {
-            // оранжевый спиннер распознавания
             p.save();
             p.translate(dot);
             p.rotate(m_phase * 40.0);
-            p.setPen(QPen(QColor(255, 190, 64), 3.5, Qt::SolidLine, Qt::RoundCap));
-            p.drawArc(QRectF(-9.5, -9.5, 19, 19), 0, 110 * 16);
+            p.setPen(QPen(QColor(64, 130, 255), 3, Qt::SolidLine, Qt::RoundCap));
+            p.drawArc(QRectF(-8.5, -8.5, 17, 17), 90, 240 * 16);
             p.restore();
         } else {
-            // пульсирующая красная точка записи
-            const qreal pulse = 0.5 + 0.5 * qAbs(qSin(m_phase));
-            p.setBrush(QColor(255, 64, 64, 120));
-            p.drawEllipse(dot, 9 + pulse * 4, 9 + pulse * 4);
-            p.setBrush(QColor(255, 64, 64));
-            p.drawEllipse(dot, 6, 6);
+            const qreal pulse = 0.5 - 0.5 * qCos(m_phase);
+            p.setBrush(QColor(235, 50, 50, 150));
+            p.drawEllipse(dot, 6 + pulse * 2.5, 6 + pulse * 2.5);
+            p.setBrush(QColor(235, 50, 50));
+            p.drawEllipse(dot, 4.5, 4.5);
         }
 
-        // текст
-        QFont f = font();
-        f.setPointSize(10);
-        f.setBold(true);
-        p.setFont(f);
-        p.setPen(QColor(255, 255, 255));
-        p.drawText(QRect(48, 10, 150, height() - 20),
-                   Qt::AlignVCenter | Qt::AlignLeft,
-                   m_transcribing ? QStringLiteral("Распознаю...")
-                                  : QStringLiteral("Запись..."));
+        auto rnd = [](qreal x) {
+            const qreal v = qAbs(qSin(x * 127.1 + 311.7));
+            return v - qFloor(v);
+        };
 
-        // волна голоса (в отдельной правой зоне, не наезжая на индикатор и текст)
-        const qreal baseH = m_transcribing ? 12.0 : 24.0;
-        const int bw = 6, gap = 4, nb = kWaveBars;
-        const int totalW = nb * bw + (nb - 1) * gap;
-        int x0 = width() - totalW - 22;
-        if (x0 < 170) { x0 = 170; }
+        if (m_transcribing) {
+            static const QString glyphs =
+                QStringLiteral(
+                    u"abcdefghijklmnopqrstuvwxyz"
+                    u"абвгдежзиклмнопрстуфхцчшщъыьэюя"
+                    u"АБВГДЕЖЗИКЛМНОПРСТУФХЦЧШЩ"
+                    u"0123456789!?@#$%&*+=<>|()[]{};.,~^-_"
+                    u"αβγδεζηθικλμνξοπρστυφχψω"
+                    u"★☆◆◇■□▲△●○▬♥♦♣♠☺☻∞");
+            const int n = glyphs.size();
+            const qreal cw = 13.0;
+            const int xEnd = 156;
+            const int xStart = 47;
+            const qreal drift = m_phase * 10.0;
+            const int mHi = int(qFloor(drift / cw)) + 1;
+            const int mLo = int(qCeil((drift + xStart - xEnd) / cw));
+
+            QFont fnt = font();
+            fnt.setPixelSize(11);
+            fnt.setBold(true);
+            p.setFont(fnt);
+            p.setPen(QColor(0, 0, 0));
+            const qreal cy = height() / 2.0;
+
+            p.save();
+            p.setClipRect(QRect(xStart, 0, xEnd - xStart, height()));
+
+            for (int m = qMax(mLo, mHi - 200); m <= mHi; ++m) {
+                const qreal x = xEnd + cw * m - drift;
+                if (x < xStart - cw || x > xEnd + cw) continue;
+                const QChar ch = glyphs.at(int(rnd(qreal(m)) * n) % n);
+                p.drawText(QRectF(x, cy - 9, cw, 18),
+                           Qt::AlignVCenter | Qt::AlignLeft, QString(ch));
+            }
+            p.restore();
+            return;
+        }
+
+        const int bw = 5, gap = 3, nb = 14;
+        const qreal maxH = height() - 10;
+        const int x0 = 47;
+
+        auto ampAt = [&](qreal pp) {
+            const qreal kk = qFloor(pp);
+            const qreal ff = pp - kk;
+            return rnd(kk) + (rnd(kk + 1.0) - rnd(kk)) * ff;
+        };
+        auto smooth = [](qreal e, qreal a, qreal b) {
+            qreal t = (e - a) / (b - a);
+            t = qBound<qreal>(0.0, t, 1.0);
+            return t * t * (3.0 - 2.0 * t);
+        };
+
+        const qreal offset = m_phase * 0.85;
+        const qreal step = 0.5;
         for (int i = 0; i < nb; ++i) {
-            const qreal h = 6 + baseH * (0.5 + 0.5 * qAbs(qSin(m_phase * (m_transcribing ? 0.6 : 1.1) + i * 0.45)));
-            const QRectF bar(x0 + i * (bw + gap), height() / 2.0 - h / 2, bw, h);
+            const qreal pos = i * step + offset;
+            const qreal coarse = ampAt(pos / 4.0);
+            const qreal energy = 0.15 + 0.85 * smooth(coarse, 0.35, 0.7);
+            const qreal h = 4 + maxH * energy * ampAt(pos);
+            const QRectF r(x0 + i * (bw + gap), height() / 2.0 - h / 2, bw, h);
             p.setPen(Qt::NoPen);
-            p.setBrush(m_transcribing ? QColor(255, 190, 64) : QColor(70, 205, 115));
-            p.drawRoundedRect(bar, 3, 3);
+            p.setBrush(QColor(0, 0, 0));
+            p.drawRoundedRect(r, 2, 2);
         }
     }
 
 private:
     double m_phase = 0.0;
     bool m_transcribing = false;
+};
+
+// --- контроллер диктовки ------------------------------------------------
+
+class DictationController : public QObject
+{
+    Q_OBJECT
+public:
+    explicit DictationController(OverlayWidget *overlay, QObject *parent = nullptr)
+        : QObject(parent), m_overlay(overlay)
+    {
+        m_parec = new QProcess(this);
+        m_ffmpeg = new QProcess(this);
+
+        // ffmpeg финализирует файл при EOF — поэтому концовка не теряется
+        m_ffmpeg->setProgram(QStringLiteral("ffmpeg"));
+        m_ffmpeg->setArguments({QStringLiteral("-loglevel"), QStringLiteral("error"),
+                                QStringLiteral("-f"),         QStringLiteral("s16le"),
+                                QStringLiteral("-ar"),        QStringLiteral("16000"),
+                                QStringLiteral("-ac"),        QStringLiteral("1"),
+                                QStringLiteral("-i"),         QStringLiteral("pipe:0"),
+                                QStringLiteral("-c:a"),       QStringLiteral("pcm_s16le"),
+                                wavPath()});
+
+        // Пересылаем поток parec в stdin ffmpeg вручную. Штатный
+        // setStandardOutputProcess работал только первые циклы записи, затем НЕ
+        // подключал пайп заново и WAV получался пустым (78 байт). Ручная
+        // пересылка детерминирована при переиспользовании обоих процессов.
+        m_parec->setProcessChannelMode(QProcess::SeparateChannels);
+        connect(m_parec, &QProcess::readyReadStandardOutput, this, [this]() {
+            m_ffmpeg->write(m_parec->readAllStandardOutput());
+        });
+        // EOF источника => закрываем stdin ffmpeg => ffmpeg дописывает WAV и выходит.
+        // Закрываем НЕ сразу, а только когда Qt допишет в ffmpeg последний кусок
+        // звука (иначе хвост фразы теряется).
+        connect(m_parec, &QProcess::finished, this, [this](int, QProcess::ExitStatus) {
+            m_ffmpeg->write(m_parec->readAllStandardOutput());
+            flushAndCloseFfmpegInput();
+        });
+        connect(m_ffmpeg, &QProcess::finished, this, [this](int code, QProcess::ExitStatus st) {
+            logMsg(QStringLiteral("[ffmpeg] finished code=%1 exit=%2")
+                       .arg(code).arg(qint64(st)));
+            onRecordingFinished();
+        });
+        connect(m_ffmpeg, &QProcess::errorOccurred, this, [this](QProcess::ProcessError e) {
+            logMsg(QStringLiteral("[ffmpeg] errorOccurred=%1").arg(qint64(e)));
+        });
+        connect(m_parec, &QProcess::errorOccurred, this, [this](QProcess::ProcessError e) {
+            logMsg(QStringLiteral("[parec] errorOccurred=%1").arg(qint64(e)));
+        });
+
+        // Страховка от зависания: если после стопа ffmpeg не завершится сам,
+        // форсируем переход к распознаванию (не блокируя GUI waitForFinished'ом).
+        m_stopDeadline = new QTimer(this);
+        m_stopDeadline->setInterval(kFinishTimeoutMs);
+        m_stopDeadline->setSingleShot(true);
+        connect(m_stopDeadline, &QTimer::timeout, this, [this]() {
+            onStopDeadline();
+        });
+    }
+
+    // Вызывается по нажатию горячей клавиши: начать/остановить диктовку.
+    void toggle()
+    {
+        switch (m_state) {
+        case State::Idle:
+            startRecording();
+            break;
+        case State::Recording:
+            stopRecording();
+            break;
+        case State::Transcribing:
+            // распознавание уже идёт — игнорируем повторное нажатие
+            break;
+        }
+    }
+
+signals:
+    // Оверлей слушает напрямую через состояние.
+    void busyChanged(bool active, bool transcribing);
+
+private:
+    enum class State { Idle, Recording, Transcribing };
+
+    void setOverlay()
+    {
+        const bool active = m_state != State::Idle;
+        const bool tr = m_state == State::Transcribing;
+        m_overlay->setDisplay(tr);
+        m_overlay->setVisible(active);
+        emit busyChanged(active, tr);
+    }
+
+    void startRecording()
+    {
+        m_state = State::Recording;
+        setOverlay();
+        beep(QStringLiteral("beep_start"));
+        notify(QStringLiteral("Запись началась"),
+               QStringLiteral("Говори. Повторное нажатие — распознать текст"));
+
+        QDir().mkpath(QDir(dataDir() + QStringLiteral("/tmp")).path());
+        QFile::remove(wavPath());
+        QFile::remove(outPath() + QStringLiteral(".txt"));
+        logMsg(QStringLiteral("запись началась"));
+
+        m_stopDeadline->stop();
+        m_transcribeStarted = false;
+        // Аргументы ffmpeg заданы в конструкторе: стартуем через start() без списка.
+        // Перезапись аргументов пустым списком (start("ffmpeg", {})) роняла ffmpeg
+        // с code=1 сразу после старта — запись не шла, индикатор вис навсегда.
+        m_ffmpeg->start();
+        m_parec->start(QStringLiteral("parec"),
+                       {QStringLiteral("--raw"), QStringLiteral("--format=s16le"),
+                        QStringLiteral("--rate=16000"), QStringLiteral("--channels=1")});
+    }
+
+    void stopRecording()
+    {
+        // добираем хвост последних слов, потом плавно останавливаем parec
+        beep(QStringLiteral("beep_stop"));
+        m_state = State::Transcribing;
+        setOverlay();
+        notify(QStringLiteral("Распознаю..."), QString());
+        logMsg(QStringLiteral("запись остановлена, распознаю..."));
+
+        // Страховка: если ffmpeg не завершится сам по EOF (или уже стоит),
+        // deadline принудительно переведёт нас в распознавание.
+        m_stopDeadline->start();
+        QTimer::singleShot(kPostRollMs, this, [this]() {
+            // закрываем источник: parec завершается, ffmpeg дочитает пайп до EOF
+            // и корректно допишет WAV (концовка не теряется).
+            if (m_parec->state() != QProcess::NotRunning) {
+                m_parec->terminate();
+            }
+        });
+    }
+
+    void onRecordingFinished()
+    {
+        if (m_state == State::Recording) {
+            // запись оборвалась сразу (микрофон недоступен, parec/ffmpeg не
+            // поднялись) — не виснуть в Recording, корректно вернуться в покой.
+            m_stopDeadline->stop();
+            beep(QStringLiteral("beep_err"));
+            logMsg(QStringLiteral("ОШИБКА записи: ffmpeg завершился при старте"));
+            m_state = State::Idle;
+            setOverlay();
+            notify(QStringLiteral("Ошибка записи"), QStringLiteral("Проверь микрофон"));
+            return;
+        }
+        if (m_state != State::Transcribing) {
+            return;
+        }
+        startTranscribing();
+    }
+
+    // Страховочный путь: ffmpeg не доложил EOF вовремя — добиваем и распознаём.
+    void onStopDeadline()
+    {
+        if (m_state != State::Transcribing) {
+            return;
+        }
+        if (m_ffmpeg->state() != QProcess::NotRunning) {
+            m_ffmpeg->kill(); // finished от kill тоже ведёт сюда через onRecordingFinished
+        }
+        startTranscribing();
+    }
+
+    // Дождаться, пока Qt перепишет из своего буфера весь звук в stdin ffmpeg,
+    // и только потом закрыть канал (EOF), чтобы не обрезать хвост фразы.
+    void flushAndCloseFfmpegInput()
+    {
+        if (m_ffmpeg == nullptr || m_ffmpeg->state() == QProcess::NotRunning) {
+            return; // ffmpeg уже завершился — канал закрывать некому
+        }
+        if (m_ffmpegClosing) {
+            return;
+        }
+        if (m_ffmpeg->bytesToWrite() > 0) {
+            m_ffmpegClosing = true;
+            QTimer::singleShot(3, this, [this]() {
+                m_ffmpegClosing = false;
+                flushAndCloseFfmpegInput();
+            });
+            return;
+        }
+        m_ffmpeg->closeWriteChannel();
+    }
+
+    void startTranscribing()
+    {
+        if (m_transcribeStarted) {
+            return;
+        }
+        m_transcribeStarted = true;
+        m_stopDeadline->stop();
+        archiveStart();
+        transcribe();
+    }
+
+    // Архивный цикл: папка на каждую запись с аудио и текстом распознавания.
+    // Нужен, чтобы при повторении проблем («обрезается конец фразы») можно было
+    // сравнить WAV и TXT одного цикла и понять, где теряется звук.
+    void archiveStart()
+    {
+        const QString base = dataDir() + QStringLiteral("/dictations");
+        QDir().mkpath(base);
+        m_runDir = base + QLatin1Char('/')
+                   + QDateTime::currentDateTime().toString(
+                       QStringLiteral("yyyyMMdd-HHmmss-zzz"));
+        QDir().mkpath(m_runDir);
+        QFile::copy(wavPath(), m_runDir + QStringLiteral("/audio.wav"));
+        logMsg(QStringLiteral("архив записи: ") + m_runDir);
+    }
+
+    void archiveText(const QString &fallback)
+    {
+        if (m_runDir.isEmpty()) {
+            return;
+        }
+        QString content = fallback;
+        QFile fi(outPath() + QStringLiteral(".txt"));
+        if (fi.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            content = QString::fromUtf8(fi.readAll());
+            fi.close();
+        }
+        if (content.trimmed().isEmpty() && !fallback.trimmed().isEmpty()) {
+            content = fallback;
+        }
+        QFile fo(m_runDir + QStringLiteral("/text.txt"));
+        if (fo.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            fo.write(content.toUtf8());
+            fo.close();
+        }
+        m_runDir.clear();
+    }
+
+    void transcribe()
+    {
+        logMsg(QStringLiteral("запуск whisper-cli"));
+        notify(QStringLiteral("Распознаю..."), QString());
+
+        QProcess *w = new QProcess(this);
+        w->setProcessChannelMode(QProcess::ForwardedErrorChannel);
+        w->setProgram(QStringLiteral("whisper-cli"));
+        w->setArguments({QStringLiteral("-m"), modelPath(),
+                         QStringLiteral("-f"), wavPath(),
+                         QStringLiteral("-l"), QStringLiteral("ru"),
+                         QStringLiteral("--prompt"), hotwordPrompt(),
+                         QStringLiteral("-otxt"), QStringLiteral("-of"), outPath(),
+                         QStringLiteral("-np"), QStringLiteral("-t"),
+                         QString::number(QThread::idealThreadCount())});
+        connect(w, &QProcess::finished, this, [this](int exitCode, QProcess::ExitStatus) {
+            QProcess *wdel = qobject_cast<QProcess *>(sender());
+            wdel->deleteLater();
+            if (exitCode != 0) {
+                finishFailure();
+                return;
+            }
+            readResult();
+        });
+        w->start();
+    }
+
+    void readResult()
+    {
+        QFile f(outPath() + QStringLiteral(".txt"));
+        QString text;
+        if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            text = QString::fromUtf8(f.readAll());
+            text.replace(QLatin1Char('\n'), QLatin1Char(' '));
+            text = text.simplified();
+        }
+
+        if (text.isEmpty()) {
+            finishEmpty();
+            return;
+        }
+        archiveText(QString());
+
+        // в буфер обмена (wl-clipboard) и в историю
+        QProcess *copy = new QProcess(this);
+        copy->setProgram(QStringLiteral("wl-copy"));
+        copy->start();
+        copy->write(text.toUtf8());
+        copy->closeWriteChannel();
+        connect(copy, &QProcess::finished, copy, &QObject::deleteLater);
+
+        QFile h(historyPath());
+        if (h.open(QIODevice::Append | QIODevice::Text)) {
+            h.write(text.toUtf8());
+            h.write("\n");
+        }
+
+        m_state = State::Idle;
+        setOverlay();
+        logMsg(QStringLiteral("готово: ") + text);
+        notify(QStringLiteral("Готово — Ctrl+V"), text);
+    }
+
+    void finishFailure()
+    {
+        beep(QStringLiteral("beep_err"));
+        logMsg(QStringLiteral("ОШИБКА распознавания"));
+        archiveText(QStringLiteral("ОШИБКА распознавания"));
+        m_state = State::Idle;
+        setOverlay();
+        notify(QStringLiteral("Ошибка распознавания"), QStringLiteral("Повтори попытку"));
+    }
+
+    void finishEmpty()
+    {
+        archiveText(QStringLiteral("ничего не распознано"));
+        m_state = State::Idle;
+        setOverlay();
+        logMsg(QStringLiteral("ничего не распознано"));
+        notify(QStringLiteral("Ничего не распознано"),
+               QStringLiteral("Повтори: нажми клавишу, говори, нажми ещё раз"));
+    }
+
+    OverlayWidget *m_overlay = nullptr;
+    QProcess *m_parec = nullptr;
+    QProcess *m_ffmpeg = nullptr;
+    QTimer *m_stopDeadline = nullptr;
+    State m_state = State::Idle;
+    bool m_transcribeStarted = false;
+    bool m_ffmpegClosing = false;
+    QString m_runDir;
 };
 
 // --- main ---------------------------------------------------------------
@@ -200,7 +619,7 @@ int main(int argc, char **argv)
     QApplication app(argc, argv);
     app.setApplicationName(QStringLiteral("whisper-hotkeyd"));
     app.setApplicationDisplayName(QStringLiteral("Whisper Dictation"));
-    app.setApplicationVersion(QStringLiteral("0.1.0"));
+    app.setApplicationVersion(QStringLiteral("0.2.0"));
 
     QKeySequence hotkey(QStringLiteral("Ctrl+E"));
     if (qEnvironmentVariableIsSet("WHISPER_HOTKEY")) {
@@ -215,41 +634,17 @@ int main(int argc, char **argv)
     KGlobalAccel::self()->setShortcut(action, QList<QKeySequence>{hotkey});
 
     OverlayWidget overlay;
+    DictationController controller(&overlay);
 
-    auto refreshOverlay = [&]() {
-        const QString st = readState();
-        bool transcribing = false;
-        bool active = false;
-        if (st == QLatin1String("recording")) {
-            active = true;
-        } else if (st == QLatin1String("transcribing")) {
-            active = true;
-            transcribing = true;
-        } else {
-            active = recordingActive();   // fallback: pid-файл (старый скрипт)
-        }
-        if (active) {
-            overlay.setDisplay(transcribing);
-        }
-        overlay.setVisible(active);
-    };
+    QObject::connect(action, &QAction::triggered, &controller, &DictationController::toggle);
 
-    QObject::connect(action, &QAction::triggered, [&]() {
-        QProcess::startDetached(scriptPath());
-        QTimer::singleShot(std::chrono::milliseconds(250), &overlay, [&]() {
-            refreshOverlay();
-        });
-    });
-
-    QTimer *poll = new QTimer(&app);
-    QObject::connect(poll, &QTimer::timeout, refreshOverlay);
-    poll->start(kPollMs);
-
-    std::fprintf(stderr,
-                 "whisper-hotkeyd: hotkey=%s script=%s (idle: ~few MB RAM)\n",
+    std::fprintf(stderr, "whisper-hotkeyd %s: hotkey=%s model=%s (idle: ~few MB RAM)\n",
+                 app.applicationVersion().toUtf8().constData(),
                  hotkey.toString().toUtf8().constData(),
-                 scriptPath().toUtf8().constData());
+                 modelPath().toUtf8().constData());
     std::fflush(stderr);
 
     return app.exec();
 }
+
+#include "whisper-hotkeyd.moc"
