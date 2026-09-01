@@ -28,7 +28,10 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QMenu>
+#include <QSettings>
 #include <QStandardPaths>
+#include <QSystemTrayIcon>
 #include <QThread>
 #include <QDateTime>
 #include <QtMath>
@@ -115,8 +118,21 @@ static void beep(const QString &name)
 
 static void notify(const QString &title, const QString &body)
 {
+    if (!QSettings(QStringLiteral("whisper-dictate"), QStringLiteral("whisper-hotkeyd"))
+             .value(QStringLiteral("notifications"), true)
+             .toBool()) {
+        return;
+    }
     fireAndForget(QStringLiteral("notify-send"),
                   {QStringLiteral("-a"), QStringLiteral("Whisper"), title, body});
+}
+
+static void setNotificationsEnabled(bool enabled)
+{
+    QSettings settings(QStringLiteral("whisper-dictate"),
+                       QStringLiteral("whisper-hotkeyd"));
+    settings.setValue(QStringLiteral("notifications"), enabled);
+    settings.sync();
 }
 
 // --- оверлей ------------------------------------------------------------
@@ -281,6 +297,69 @@ protected:
 private:
     double m_phase = 0.0;
     bool m_transcribing = false;
+};
+
+class TrayIndicator : public QObject
+{
+public:
+    explicit TrayIndicator(QObject *parent = nullptr)
+        : QObject(parent), m_tray(new QSystemTrayIcon(this)), m_menu(new QMenu())
+    {
+        m_status = new QAction(m_menu);
+        m_status->setEnabled(false);
+        m_menu->addAction(m_status);
+        m_notifications = m_menu->addAction(QStringLiteral("Показывать уведомления"));
+        m_notifications->setCheckable(true);
+        m_notifications->setChecked(QSettings(QStringLiteral("whisper-dictate"),
+                                              QStringLiteral("whisper-hotkeyd"))
+                                        .value(QStringLiteral("notifications"), true)
+                                        .toBool());
+        connect(m_notifications, &QAction::toggled, this, [](bool enabled) {
+            setNotificationsEnabled(enabled);
+        });
+        m_menu->addSeparator();
+        QAction *quit = m_menu->addAction(QStringLiteral("Выйти"));
+        connect(quit, &QAction::triggered, qApp, &QCoreApplication::quit);
+        m_tray->setContextMenu(m_menu);
+        setState(false, false);
+        m_tray->show();
+    }
+
+    void setState(bool active, bool transcribing)
+    {
+        QString label;
+        QColor color;
+        if (transcribing) {
+            label = QStringLiteral("Whisper: распознавание");
+            color = QColor(55, 125, 235);
+        } else if (active) {
+            label = QStringLiteral("Whisper: запись");
+            color = QColor(225, 55, 55);
+        } else {
+            label = QStringLiteral("Whisper: готов");
+            color = QColor(125, 135, 150);
+        }
+
+        QPixmap pixmap(24, 24);
+        pixmap.fill(Qt::transparent);
+        QPainter painter(&pixmap);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(35, 35, 40));
+        painter.drawEllipse(QRectF(2, 2, 20, 20));
+        painter.setBrush(color);
+        painter.drawEllipse(QRectF(6, 6, 12, 12));
+
+        m_tray->setIcon(QIcon(pixmap));
+        m_tray->setToolTip(label + QStringLiteral("\nCtrl+E — начать или остановить"));
+        m_status->setText(label);
+    }
+
+private:
+    QSystemTrayIcon *m_tray;
+    QMenu *m_menu;
+    QAction *m_status;
+    QAction *m_notifications;
 };
 
 // --- контроллер диктовки ------------------------------------------------
@@ -650,6 +729,7 @@ private:
 int main(int argc, char **argv)
 {
     QApplication app(argc, argv);
+    app.setQuitOnLastWindowClosed(false);
     app.setApplicationName(QStringLiteral("whisper-hotkeyd"));
     app.setApplicationDisplayName(QStringLiteral("Whisper Dictation"));
     app.setApplicationVersion(QStringLiteral("0.2.0"));
@@ -667,9 +747,14 @@ int main(int argc, char **argv)
     KGlobalAccel::self()->setShortcut(action, QList<QKeySequence>{hotkey});
 
     OverlayWidget overlay;
+    TrayIndicator tray;
     DictationController controller(&overlay);
 
     QObject::connect(action, &QAction::triggered, &controller, &DictationController::toggle);
+    QObject::connect(&controller, &DictationController::busyChanged,
+                     &tray, [&tray](bool active, bool transcribing) {
+                         tray.setState(active, transcribing);
+                     });
 
     std::fprintf(stderr, "whisper-hotkeyd %s: hotkey=%s model=%s (idle: ~few MB RAM)\n",
                  app.applicationVersion().toUtf8().constData(),

@@ -40,7 +40,8 @@ echo
 echo "==> 4/5 Демон горячей клавиши"
 if [ -x "../src/build/whisper-hotkeyd" ]; then
     install -m 755 "../src/build/whisper-hotkeyd" "$HOME/.local/bin/whisper-hotkeyd"
-    install -m 644 "../src/whisper-hotkeyd.desktop" "$HOME/.config/autostart/whisper-hotkeyd.desktop"
+    sed "s|^Exec=.*|Exec=$HOME/.local/bin/whisper-hotkeyd|" \
+        "../src/whisper-hotkeyd.desktop" > "$HOME/.config/autostart/whisper-hotkeyd.desktop"
     pkill -x whisper-hotkeyd 2>/dev/null || true
     nohup "$HOME/.local/bin/whisper-hotkeyd" \
         </dev/null >>"$HOME/.local/share/whisper/tmp/daemon.log" 2>&1 &
