@@ -376,6 +376,13 @@ private:
 
     void startRecording()
     {
+        if (m_ffmpeg->state() != QProcess::NotRunning ||
+            m_parec->state() != QProcess::NotRunning) {
+            logMsg(QStringLiteral("ОШИБКА записи: предыдущий процесс ещё работает"));
+            beep(QStringLiteral("beep_err"));
+            notify(QStringLiteral("Ошибка записи"), QStringLiteral("Предыдущая запись ещё завершается"));
+            return;
+        }
         m_state = State::Recording;
         setOverlay();
         beep(QStringLiteral("beep_start"));
@@ -389,6 +396,7 @@ private:
 
         m_stopDeadline->stop();
         m_transcribeStarted = false;
+        m_ffmpegClosing = false;
         // Аргументы ffmpeg заданы в конструкторе: стартуем через start() без списка.
         // Перезапись аргументов пустым списком (start("ffmpeg", {})) роняла ffmpeg
         // с code=1 сразу после старта — запись не шла, индикатор вис навсегда.
@@ -396,6 +404,15 @@ private:
         m_parec->start(QStringLiteral("parec"),
                        {QStringLiteral("--raw"), QStringLiteral("--format=s16le"),
                         QStringLiteral("--rate=16000"), QStringLiteral("--channels=1")});
+        if (!m_ffmpeg->waitForStarted(1000) || !m_parec->waitForStarted(1000)) {
+            logMsg(QStringLiteral("ОШИБКА записи: не удалось запустить parec/ffmpeg"));
+            m_ffmpeg->kill();
+            m_parec->kill();
+            m_state = State::Idle;
+            setOverlay();
+            beep(QStringLiteral("beep_err"));
+            notify(QStringLiteral("Ошибка записи"), QStringLiteral("Проверь parec, ffmpeg и микрофон"));
+        }
     }
 
     void stopRecording()
@@ -479,6 +496,11 @@ private:
         m_transcribeStarted = true;
         m_stopDeadline->stop();
         archiveStart();
+        if (m_audioPath.isEmpty()) {
+            finishFailure();
+            return;
+        }
+        m_outputPath = m_audioPath.left(m_audioPath.size() - QStringLiteral(".wav").size());
         transcribe();
     }
 
@@ -493,7 +515,10 @@ private:
                    + QDateTime::currentDateTime().toString(
                        QStringLiteral("yyyyMMdd-HHmmss-zzz"));
         QDir().mkpath(m_runDir);
-        QFile::copy(wavPath(), m_runDir + QStringLiteral("/audio.wav"));
+        m_audioPath = m_runDir + QStringLiteral("/audio.wav");
+        if (!QFile::copy(wavPath(), m_audioPath)) {
+            m_audioPath.clear();
+        }
         logMsg(QStringLiteral("архив записи: ") + m_runDir);
     }
 
@@ -503,7 +528,7 @@ private:
             return;
         }
         QString content = fallback;
-        QFile fi(outPath() + QStringLiteral(".txt"));
+        QFile fi(m_outputPath + QStringLiteral(".txt"));
         if (fi.open(QIODevice::ReadOnly | QIODevice::Text)) {
             content = QString::fromUtf8(fi.readAll());
             fi.close();
@@ -528,10 +553,10 @@ private:
         w->setProcessChannelMode(QProcess::ForwardedErrorChannel);
         w->setProgram(QStringLiteral("whisper-cli"));
         w->setArguments({QStringLiteral("-m"), modelPath(),
-                         QStringLiteral("-f"), wavPath(),
+                         QStringLiteral("-f"), m_audioPath,
                          QStringLiteral("-l"), QStringLiteral("ru"),
                          QStringLiteral("--prompt"), hotwordPrompt(),
-                         QStringLiteral("-otxt"), QStringLiteral("-of"), outPath(),
+                         QStringLiteral("-otxt"), QStringLiteral("-of"), m_outputPath,
                          QStringLiteral("-np"), QStringLiteral("-t"),
                          QString::number(QThread::idealThreadCount())});
         connect(w, &QProcess::finished, this, [this](int exitCode, QProcess::ExitStatus) {
@@ -548,7 +573,7 @@ private:
 
     void readResult()
     {
-        QFile f(outPath() + QStringLiteral(".txt"));
+        QFile f(m_outputPath + QStringLiteral(".txt"));
         QString text;
         if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
             text = QString::fromUtf8(f.readAll());
@@ -580,6 +605,8 @@ private:
         setOverlay();
         logMsg(QStringLiteral("готово: ") + text);
         notify(QStringLiteral("Готово — Ctrl+V"), text);
+        m_audioPath.clear();
+        m_outputPath.clear();
     }
 
     void finishFailure()
@@ -590,6 +617,8 @@ private:
         m_state = State::Idle;
         setOverlay();
         notify(QStringLiteral("Ошибка распознавания"), QStringLiteral("Повтори попытку"));
+        m_audioPath.clear();
+        m_outputPath.clear();
     }
 
     void finishEmpty()
@@ -600,6 +629,8 @@ private:
         logMsg(QStringLiteral("ничего не распознано"));
         notify(QStringLiteral("Ничего не распознано"),
                QStringLiteral("Повтори: нажми клавишу, говори, нажми ещё раз"));
+        m_audioPath.clear();
+        m_outputPath.clear();
     }
 
     OverlayWidget *m_overlay = nullptr;
@@ -610,6 +641,8 @@ private:
     bool m_transcribeStarted = false;
     bool m_ffmpegClosing = false;
     QString m_runDir;
+    QString m_audioPath;
+    QString m_outputPath;
 };
 
 // --- main ---------------------------------------------------------------
