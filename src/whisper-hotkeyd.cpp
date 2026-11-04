@@ -34,6 +34,16 @@
 #include <QSystemTrayIcon>
 #include <QThread>
 #include <QDateTime>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QFileDialog>
+#include <QFormLayout>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QLineEdit>
+#include <QMessageBox>
+#include <QPushButton>
+#include <QVBoxLayout>
 #include <QtMath>
 #include <chrono>
 
@@ -55,9 +65,16 @@ static QString dataDir()
     return QDir::homePath() + QStringLiteral("/.local/share/whisper");
 }
 
-static QString modelPath()
+static QString defaultModelPath()
 {
     return dataDir() + QStringLiteral("/models/ggml-large-v3-turbo-q8_0.bin");
+}
+
+static QString modelPath()
+{
+    return QSettings(QStringLiteral("whisper-dictate"), QStringLiteral("whisper-hotkeyd"))
+        .value(QStringLiteral("modelPath"), defaultModelPath())
+        .toString();
 }
 
 static QString wavPath()
@@ -136,6 +153,74 @@ static void setNotificationsEnabled(bool enabled)
 }
 
 // --- оверлей ------------------------------------------------------------
+
+class SettingsDialog : public QDialog
+{
+public:
+    explicit SettingsDialog(QWidget *parent = nullptr)
+        : QDialog(parent)
+    {
+        setWindowTitle(QStringLiteral("Настройки Whisper Dictation"));
+        setMinimumWidth(620);
+
+        QVBoxLayout *layout = new QVBoxLayout(this);
+        QLabel *description = new QLabel(
+            QStringLiteral("Выберите локальный файл модели Whisper в формате whisper.cpp. ")
+            + QStringLiteral("Новая модель будет использована при следующем распознавании."), this);
+        description->setWordWrap(true);
+        layout->addWidget(description);
+
+        QFormLayout *form = new QFormLayout();
+        QWidget *modelRow = new QWidget(this);
+        QHBoxLayout *modelLayout = new QHBoxLayout(modelRow);
+        modelLayout->setContentsMargins(0, 0, 0, 0);
+        m_model = new QLineEdit(modelPath(), modelRow);
+        QPushButton *browse = new QPushButton(QStringLiteral("Обзор..."), modelRow);
+        modelLayout->addWidget(m_model, 1);
+        modelLayout->addWidget(browse);
+        form->addRow(QStringLiteral("Модель:"), modelRow);
+        layout->addLayout(form);
+
+        QLabel *hint = new QLabel(
+            QStringLiteral("Текущая поставка: large-v3-turbo q8_0, около 874 МБ. ")
+            + QStringLiteral("Файл остаётся на компьютере и никуда не отправляется."), this);
+        hint->setWordWrap(true);
+        layout->addWidget(hint);
+
+        QDialogButtonBox *buttons = new QDialogButtonBox(
+            QDialogButtonBox::Save | QDialogButtonBox::Cancel, this);
+        buttons->button(QDialogButtonBox::Save)->setText(QStringLiteral("Сохранить"));
+        buttons->button(QDialogButtonBox::Cancel)->setText(QStringLiteral("Отмена"));
+        layout->addWidget(buttons);
+
+        connect(browse, &QPushButton::clicked, this, [this]() {
+            const QString selected = QFileDialog::getOpenFileName(
+                this, QStringLiteral("Выберите модель Whisper"),
+                QFileInfo(m_model->text()).absolutePath(),
+                QStringLiteral("Модели Whisper (*.bin);;Все файлы (*)"));
+            if (!selected.isEmpty()) {
+                m_model->setText(selected);
+            }
+        });
+        connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+        connect(buttons, &QDialogButtonBox::accepted, this, [this]() {
+            const QString path = QDir::cleanPath(m_model->text().trimmed());
+            if (!QFileInfo(path).isFile()) {
+                QMessageBox::warning(this, QStringLiteral("Файл не найден"),
+                                     QStringLiteral("Выберите существующий файл модели."));
+                return;
+            }
+            QSettings settings(QStringLiteral("whisper-dictate"),
+                               QStringLiteral("whisper-hotkeyd"));
+            settings.setValue(QStringLiteral("modelPath"), path);
+            settings.sync();
+            accept();
+        });
+    }
+
+private:
+    QLineEdit *m_model = nullptr;
+};
 
 class OverlayWidget : public QWidget
 {
@@ -318,9 +403,19 @@ public:
             setNotificationsEnabled(enabled);
         });
         m_menu->addSeparator();
+        QAction *settings = m_menu->addAction(QStringLiteral("Настройки..."));
+        connect(settings, &QAction::triggered, this, [this]() {
+            showSettings();
+        });
         QAction *quit = m_menu->addAction(QStringLiteral("Выйти"));
         connect(quit, &QAction::triggered, qApp, &QCoreApplication::quit);
         m_tray->setContextMenu(m_menu);
+        connect(m_tray, &QSystemTrayIcon::activated, this,
+                [this](QSystemTrayIcon::ActivationReason reason) {
+                    if (reason == QSystemTrayIcon::Trigger) {
+                        showSettings();
+                    }
+                });
         setState(false, false);
         m_tray->show();
     }
@@ -356,10 +451,27 @@ public:
     }
 
 private:
+    void showSettings()
+    {
+        if (m_settings) {
+            m_settings->show();
+            m_settings->raise();
+            m_settings->activateWindow();
+            return;
+        }
+        m_settings = new SettingsDialog();
+        m_settings->setAttribute(Qt::WA_DeleteOnClose);
+        connect(m_settings, &QObject::destroyed, this, [this]() {
+            m_settings = nullptr;
+        });
+        m_settings->show();
+    }
+
     QSystemTrayIcon *m_tray;
     QMenu *m_menu;
     QAction *m_status;
     QAction *m_notifications;
+    SettingsDialog *m_settings = nullptr;
 };
 
 // --- контроллер диктовки ------------------------------------------------
@@ -625,13 +737,19 @@ private:
 
     void transcribe()
     {
-        logMsg(QStringLiteral("запуск whisper-cli"));
+        const QString selectedModel = modelPath();
+        if (!QFileInfo(selectedModel).isFile()) {
+            logMsg(QStringLiteral("ОШИБКА: файл модели не найден: ") + selectedModel);
+            finishFailure(QStringLiteral("Выбранный файл модели не найден"));
+            return;
+        }
+        logMsg(QStringLiteral("запуск whisper-cli, модель: ") + selectedModel);
         notify(QStringLiteral("Распознаю..."), QString());
 
         QProcess *w = new QProcess(this);
         w->setProcessChannelMode(QProcess::ForwardedErrorChannel);
         w->setProgram(QStringLiteral("whisper-cli"));
-        w->setArguments({QStringLiteral("-m"), modelPath(),
+        w->setArguments({QStringLiteral("-m"), selectedModel,
                          QStringLiteral("-f"), m_audioPath,
                          QStringLiteral("-l"), QStringLiteral("ru"),
                          QStringLiteral("--prompt"), hotwordPrompt(),
@@ -642,7 +760,7 @@ private:
             QProcess *wdel = qobject_cast<QProcess *>(sender());
             wdel->deleteLater();
             if (exitCode != 0) {
-                finishFailure();
+                finishFailure(QStringLiteral("Проверь файл модели и журнал"));
                 return;
             }
             readResult();
@@ -688,14 +806,14 @@ private:
         m_outputPath.clear();
     }
 
-    void finishFailure()
+    void finishFailure(const QString &message = QStringLiteral("Повтори попытку"))
     {
         beep(QStringLiteral("beep_err"));
         logMsg(QStringLiteral("ОШИБКА распознавания"));
         archiveText(QStringLiteral("ОШИБКА распознавания"));
         m_state = State::Idle;
         setOverlay();
-        notify(QStringLiteral("Ошибка распознавания"), QStringLiteral("Повтори попытку"));
+        notify(QStringLiteral("Ошибка распознавания"), message);
         m_audioPath.clear();
         m_outputPath.clear();
     }
